@@ -440,6 +440,7 @@ static int async_read(struct shell_uart_async *sh_uart,
 	size_t blen;
 	struct uart_async_rx *async_rx = &sh_uart->async_rx;
 	size_t sh_cnt = 0;
+	bool buf_available = false;
 
 #ifdef CONFIG_MCUMGR_TRANSPORT_SHELL
 	struct smp_shell_data *const smp = &sh_uart->common.smp;
@@ -463,7 +464,7 @@ static int async_read(struct shell_uart_async *sh_uart,
 				((uint8_t *)data)[sh_cnt++] = buf[i];
 				found_shell_byte = true;
 				/* We found a shell byte, consume all bytes processed so far */
-				uart_async_rx_data_consume(async_rx, smp_consumed + 1);
+				buf_available = uart_async_rx_data_consume(async_rx, smp_consumed + 1);
 				/* Stop processing and return the shell byte */
 				break;
 			}
@@ -474,7 +475,7 @@ static int async_read(struct shell_uart_async *sh_uart,
 		/* If we processed only SMP bytes (no shell byte found) */
 		if (!found_shell_byte) {
 			/* Consume all the SMP bytes */
-			uart_async_rx_data_consume(async_rx, smp_consumed);
+			buf_available = uart_async_rx_data_consume(async_rx, smp_consumed);
 			/* Continue looping to process more data */
 		} else {
 			/* We found a shell byte, stop looping */
@@ -489,7 +490,7 @@ static int async_read(struct shell_uart_async *sh_uart,
 		blen = uart_async_rx_data_claim(async_rx, &buf, 1);
 		if (blen > 0) {
 			/* More data available, consume nothing and signal shell */
-			uart_async_rx_data_consume(async_rx, 0);
+			buf_available = uart_async_rx_data_consume(async_rx, 0);
 			sh_uart->common.handler(SHELL_TRANSPORT_EVT_RX_RDY,
 						sh_uart->common.context);
 		}
@@ -498,11 +499,10 @@ static int async_read(struct shell_uart_async *sh_uart,
 	blen = uart_async_rx_data_claim(async_rx, &buf, length);
 	sh_cnt = blen;
 	memcpy(data, buf, blen);
-	uart_async_rx_data_consume(async_rx, blen);
+	buf_available = uart_async_rx_data_consume(async_rx, blen);
 #endif
 
 	*cnt = sh_cnt;
-	bool buf_available = uart_async_rx_get_buf_len(async_rx) > 0;
 
 	if (sh_uart->pending_rx_req && buf_available) {
 		uint8_t *req_buf = uart_async_rx_buf_req(async_rx);
