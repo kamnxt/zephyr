@@ -228,7 +228,7 @@ static void irq_init(struct shell_uart_int_driven *sh_uart)
 
 static int rx_enable(const struct device *dev, uint8_t *buf, size_t len)
 {
-	return uart_rx_enable(dev, buf, len, 10000);
+	return uart_rx_enable(dev, buf, len, CONFIG_SHELL_BACKEND_SERIAL_ASYNC_RX_TIMEOUT);
 }
 
 static void async_init(struct shell_uart_async *sh_uart)
@@ -439,38 +439,84 @@ static int async_read(struct shell_uart_async *sh_uart,
 	uint8_t *buf;
 	size_t blen;
 	struct uart_async_rx *async_rx = &sh_uart->async_rx;
-
-	blen = uart_async_rx_data_claim(async_rx, &buf, length);
-#ifdef CONFIG_MCUMGR_TRANSPORT_SHELL
-	struct smp_shell_data *const smp = &sh_uart->common.smp;
 	size_t sh_cnt = 0;
 
-	for (size_t i = 0; i < blen; i++) {
-		if (smp_shell_rx_bytes(smp, &buf[i], 1) == 0) {
-			((uint8_t *)data)[sh_cnt++] = buf[i];
+#ifdef CONFIG_MCUMGR_TRANSPORT_SHELL
+	struct smp_shell_data *const smp = &sh_uart->common.smp;
+
+	/* Loop to consume all SMP bytes until we either run out of data or
+	 * hit a byte that isn't part of an SMP packet.
+	 */
+	while (sh_cnt < length) {
+		blen = uart_async_rx_data_claim(async_rx, &buf, length - sh_cnt);
+		if (blen == 0) {
+			/* No more data available in buffer */
+			break;
+		}
+
+		size_t smp_consumed = 0;
+		bool found_shell_byte = false;
+
+		for (size_t i = 0; i < blen; i++) {
+			if (smp_shell_rx_bytes(smp, &buf[i], 1) == 0) {
+				/* Not an SMP byte, return it to shell */
+				((uint8_t *)data)[sh_cnt++] = buf[i];
+				found_shell_byte = true;
+				/* We found a shell byte, consume all bytes processed so far */
+				uart_async_rx_data_consume(async_rx, smp_consumed + 1);
+				/* Stop processing and return the shell byte */
+				break;
+			}
+			/* SMP consumed this byte */
+			smp_consumed++;
+		}
+
+		/* If we processed only SMP bytes (no shell byte found) */
+		if (!found_shell_byte) {
+			/* Consume all the SMP bytes */
+			uart_async_rx_data_consume(async_rx, smp_consumed);
+			/* Continue looping to process more data */
+		} else {
+			/* We found a shell byte, stop looping */
+			break;
+		}
+	}
+
+	/* If no shell bytes were found but we might have more data available,
+	 * signal the shell to read again so we don't leave bytes stuck.
+	 */
+	if (sh_cnt == 0) {
+		blen = uart_async_rx_data_claim(async_rx, &buf, 1);
+		if (blen > 0) {
+			/* More data available, consume nothing and signal shell */
+			uart_async_rx_data_consume(async_rx, 0);
+			sh_uart->common.handler(SHELL_TRANSPORT_EVT_RX_RDY,
+						sh_uart->common.context);
 		}
 	}
 #else
-	size_t sh_cnt = blen;
-
+	blen = uart_async_rx_data_claim(async_rx, &buf, length);
+	sh_cnt = blen;
 	memcpy(data, buf, blen);
+	uart_async_rx_data_consume(async_rx, blen);
 #endif
-	bool buf_available = uart_async_rx_data_consume(async_rx, sh_cnt);
+
 	*cnt = sh_cnt;
+	bool buf_available = uart_async_rx_get_buf_len(async_rx) > 0;
 
 	if (sh_uart->pending_rx_req && buf_available) {
-		uint8_t *buf = uart_async_rx_buf_req(async_rx);
+		uint8_t *req_buf = uart_async_rx_buf_req(async_rx);
 		size_t len = uart_async_rx_get_buf_len(async_rx);
 		int err;
 
-		__ASSERT_NO_MSG(buf != NULL);
+		__ASSERT_NO_MSG(req_buf != NULL);
 		atomic_dec(&sh_uart->pending_rx_req);
-		err = uart_rx_buf_rsp(sh_uart->common.dev, buf, len);
+		err = uart_rx_buf_rsp(sh_uart->common.dev, req_buf, len);
 		/* If it is too late and RX is disabled then re-enable it. */
 		if (err < 0) {
 			if (err == -EACCES) {
 				sh_uart->pending_rx_req = 0;
-				err = rx_enable(sh_uart->common.dev, buf, len);
+				err = rx_enable(sh_uart->common.dev, req_buf, len);
 			} else {
 				return err;
 			}
